@@ -2,6 +2,19 @@ import { labelToName } from "whatwg-encoding";
 
 // https://html.spec.whatwg.org/multipage/syntax.html#prescan-a-byte-stream-to-determine-its-encoding
 
+// Encoding normalization cache for performance
+const encodingCache = new Map<string, string | null>();
+
+// Helper to get cached encoding
+function getCachedEncoding(label: string): string | null {
+    if (encodingCache.has(label)) {
+        return encodingCache.get(label)!;
+    }
+    const encoding = labelToName(label);
+    encodingCache.set(label, encoding);
+    return encoding;
+}
+
 const enum State {
     // Before anything starts; can be any of BOM, UTF-16 XML declarations or meta tags
     Begin,
@@ -220,7 +233,7 @@ export class Sniffer {
 
     private setResult(label: string, type: ResultType): void {
         if (this.resultType === ResultType.DEFAULT || this.resultType > type) {
-            const encoding = labelToName(label);
+            const encoding = getCachedEncoding(label);
 
             if (encoding) {
                 this.encoding =
@@ -890,6 +903,45 @@ export class Sniffer {
     }
 
     public write(buffer: Uint8Array): void {
+        // Fast path for BOM detection at start of stream
+        if (this.offset === 0 && buffer.length >= 3) {
+            // UTF-8 BOM check (most common)
+            if (
+                buffer[0] === 0xef &&
+                buffer[1] === 0xbb &&
+                buffer[2] === 0xbf
+            ) {
+                this.setResult("utf-8", ResultType.BOM);
+                this.offset = 3;
+                // Continue processing after BOM
+                if (buffer.length > 3) {
+                    this.state = State.BeforeTag;
+                    return this.write(buffer.subarray(3));
+                }
+                return;
+            }
+            // UTF-16 LE BOM
+            if (
+                buffer.length >= 2 &&
+                buffer[0] === 0xff &&
+                buffer[1] === 0xfe
+            ) {
+                this.setResult("utf-16le", ResultType.BOM);
+                this.offset = 2;
+                return;
+            }
+            // UTF-16 BE BOM
+            if (
+                buffer.length >= 2 &&
+                buffer[0] === 0xfe &&
+                buffer[1] === 0xff
+            ) {
+                this.setResult("utf-16be", ResultType.BOM);
+                this.offset = 2;
+                return;
+            }
+        }
+
         let index = 0;
         for (
             ;
@@ -1125,6 +1177,18 @@ export function getEncoding(
     buffer: Uint8Array,
     options?: SnifferOptions,
 ): string {
+    // Fast path: Check for UTF-8 BOM (most common case)
+    if (
+        !options?.userEncoding &&
+        !options?.transportLayerEncodingLabel &&
+        buffer.length >= 3 &&
+        buffer[0] === 0xef &&
+        buffer[1] === 0xbb &&
+        buffer[2] === 0xbf
+    ) {
+        return "UTF-8";
+    }
+
     const sniffer = new Sniffer(options);
     sniffer.write(buffer);
     return sniffer.encoding;
